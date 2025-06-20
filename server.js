@@ -45,7 +45,15 @@ app.get('/circles', async (req, res) => {
       };
     });
 
-    res.json(result);
+    const camelCased = result.map(c => ({
+        id: c.id,
+         buyAmount: parseFloat(c.buyamount),
+         remaining: parseFloat(c.remaining),
+         closed: c.closed,
+         sells: c.sells
+        }));
+        res.json(camelCased);
+
   } catch (error) {
     console.error("Ошибка при получении кругов:", error);
     res.status(500).send("Ошибка сервера");
