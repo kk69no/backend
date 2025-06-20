@@ -1,4 +1,3 @@
-// server.js
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -7,7 +6,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Подключение к базе (через переменные среды)
 const pool = new Pool({
   host: process.env.PGHOST,
   port: process.env.PGPORT,
@@ -17,80 +15,86 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Проверка подключения
 pool.query('SELECT NOW()', (err, res) => {
   if (err) {
     console.error('Ошибка подключения к базе:', err);
   } else {
-    console.log('Успешное подключение к базе:', res.rows[0]);
+    console.log('Подключено к базе:', res.rows[0]);
   }
 });
 
-// Главная страница
 app.get('/', (req, res) => {
   res.send('Сервер работает');
 });
 
-// Получить список кругов и их продаж
+// Получить круги текущего пользователя
 app.get('/circles', async (req, res) => {
+  const user_id = req.query.user_id;
+  if (!user_id) return res.status(400).send("user_id обязателен");
+
   try {
-    const circles = await pool.query('SELECT * FROM circles ORDER BY id DESC');
-    const sells = await pool.query('SELECT * FROM sells');
+    const circles = await pool.query(
+      'SELECT * FROM circles WHERE user_id = $1 ORDER BY id DESC',
+      [user_id]
+    );
+    const sells = await pool.query(
+      'SELECT * FROM sells WHERE user_id = $1',
+      [user_id]
+    );
 
-    const result = circles.rows.map(circle => {
-      const circleSells = sells.rows.filter(s => s.circle_id === circle.id);
-      return {
-        ...circle,
-        sells: circleSells
-      };
-    });
+    const result = circles.rows.map(c => ({
+      id: c.id,
+      buyAmount: parseFloat(c.buyamount),
+      remaining: parseFloat(c.remaining),
+      closed: c.closed,
+      user_id: c.user_id,
+      sells: sells.rows.filter(s => s.circle_id === c.id).map(s => ({
+        id: s.id,
+        circle_id: s.circle_id,
+        amount: s.amount,
+        currency: s.currency,
+        price: s.price,
+        note: s.note
+      }))
+    }));
 
-    const camelCased = result.map(c => ({
-        id: c.id,
-         buyAmount: parseFloat(c.buyamount),
-         remaining: parseFloat(c.remaining),
-         closed: c.closed,
-         sells: c.sells
-        }));
-        res.json(camelCased);
-
+    res.json(result);
   } catch (error) {
-    console.error("Ошибка при получении кругов:", error);
-    res.status(500).send("Ошибка сервера");
+    console.error('Ошибка при получении кругов:', error);
+    res.status(500).send('Ошибка сервера');
   }
 });
 
-// Создание нового круга (покупка)
+// Создать новый круг
 app.post('/circles', async (req, res) => {
-  const { buyAmount } = req.body;
-  if (!buyAmount || buyAmount <= 0) {
-    return res.status(400).send("Неверная сумма покупки");
-  }
+  const { buyAmount, user_id } = req.body;
+  if (!buyAmount || !user_id) return res.status(400).send("Недостаточно данных");
+
   try {
     const result = await pool.query(
-      'INSERT INTO circles (buyAmount, remaining, closed) VALUES ($1, $1, false) RETURNING *',
-      [buyAmount]
+      'INSERT INTO circles (buyamount, remaining, closed, user_id) VALUES ($1, $1, false, $2) RETURNING *',
+      [buyAmount, user_id]
     );
     res.status(201).json(result.rows[0]);
   } catch (error) {
-    console.error("Ошибка при создании круга:", error);
-    res.status(500).send("Ошибка сервера");
+    console.error('Ошибка при создании круга:', error);
+    res.status(500).send('Ошибка сервера');
   }
 });
 
-// Добавление продажи в круг
+// Добавить продажу в круг
 app.post('/circles/:id/sells', async (req, res) => {
   const circleId = req.params.id;
-  const { amount, currency, price, note } = req.body;
+  const { amount, currency, price, note, user_id } = req.body;
 
-  if (!amount || !currency || !price) {
+  if (!amount || !currency || !price || !user_id) {
     return res.status(400).send("Некорректные данные");
   }
 
   try {
-    const circleResult = await pool.query('SELECT * FROM circles WHERE id = $1', [circleId]);
+    const circleResult = await pool.query('SELECT * FROM circles WHERE id = $1 AND user_id = $2', [circleId, user_id]);
     if (circleResult.rows.length === 0) {
-      return res.status(404).send("Круг не найден");
+      return res.status(404).send("Круг не найден или не ваш");
     }
 
     const circle = circleResult.rows[0];
@@ -98,7 +102,6 @@ app.post('/circles/:id/sells', async (req, res) => {
       return res.status(400).send("Недостаточно остатка или круг закрыт");
     }
 
-    // Обновляем остаток
     const newRemaining = circle.remaining - amount;
     const closed = newRemaining <= 0;
 
@@ -107,18 +110,39 @@ app.post('/circles/:id/sells', async (req, res) => {
     ]);
 
     const sellResult = await pool.query(
-      'INSERT INTO sells (circle_id, amount, currency, price, note) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [circleId, amount, currency, price, note]
+      'INSERT INTO sells (circle_id, amount, currency, price, note, user_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [circleId, amount, currency, price, note, user_id]
     );
 
     res.status(201).json(sellResult.rows[0]);
   } catch (error) {
-    console.error("Ошибка при добавлении продажи:", error);
+    console.error('Ошибка при добавлении продажи:', error);
+    res.status(500).send('Ошибка сервера');
+  }
+});
+
+// Удалить круг
+app.delete('/circles/:id', async (req, res) => {
+  const user_id = req.query.user_id;
+  const circleId = req.params.id;
+  if (!user_id) return res.status(400).send("user_id обязателен");
+
+  try {
+    const check = await pool.query('SELECT * FROM circles WHERE id = $1 AND user_id = $2', [circleId, user_id]);
+    if (check.rows.length === 0) {
+      return res.status(404).send("Круг не найден или не ваш");
+    }
+
+    await pool.query('DELETE FROM sells WHERE circle_id = $1 AND user_id = $2', [circleId, user_id]);
+    await pool.query('DELETE FROM circles WHERE id = $1 AND user_id = $2', [circleId, user_id]);
+    res.status(204).send();
+  } catch (error) {
+    console.error('Ошибка при удалении круга:', error);
     res.status(500).send("Ошибка сервера");
   }
 });
 
-// Массив мотивационных цитат
+// Цитаты (бонус)
 const quotes = [
   "Делай сегодня то, что другие не хотят, чтобы завтра жить так, как другие не могут.",
   "Успех — это лестница, на которую нельзя подняться, держа руки в карманах.",
@@ -127,13 +151,11 @@ const quotes = [
   "Ты сильнее, чем думаешь.",
 ];
 
-// Endpoint для случайной цитаты
 app.get('/quote', (req, res) => {
   const randomIndex = Math.floor(Math.random() * quotes.length);
   res.json({ quote: quotes[randomIndex] });
 });
 
-// Запуск сервера
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Сервер запущен на порту ${PORT}`);
