@@ -142,21 +142,19 @@ app.get('/analytics/:circleId', async (req, res) => {
 });
 
 // Генерация заметки через OpenAI
+// новый: локальная генерация заметки
 app.post('/note/ai', async (req, res) => {
   const { currency, price } = req.body;
-  const prompt = `Придумай краткую заметку для сделки: покупаю ${currency} по цене ${price}`;
-  const result = await axios.post('https://api.openai.com/v1/chat/completions', {
-    model: "gpt-3.5-turbo",
-    messages: [{ role: "user", content: prompt }],
-    max_tokens: 30
-  }, {
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
-    }
-  });
-
-  res.json({ note: result.data.choices[0].message.content.trim() });
+  const templates = [
+    `Сделка с ${currency} по цене ${price}₽`,
+    `Продажа ${currency} выгодно по ${price}₽`,
+    `${currency} по ${price}₽ — быстрый обмен`,
+    `Биржевой курс ${currency}: ${price}₽`
+  ];
+  const note = templates[Math.floor(Math.random() * templates.length)];
+  res.json({ note });
 });
+
 
 // Проверка кругов каждые 10 минут (долго незакрытые)
 setInterval(async () => {
