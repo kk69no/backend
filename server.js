@@ -1,4 +1,3 @@
-console.log("✅ BOT_TOKEN из process.env:", process.env.BOT_TOKEN);
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -16,11 +15,14 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Проверка Telegram initData
+// ======== Проверка initData с отладкой ========
 function verifyInitData(initDataRaw) {
   try {
     const token = process.env.BOT_TOKEN;
-    if (!token || !initDataRaw) return false;
+    if (!token || !initDataRaw) {
+      console.log("❌ Нет token или initData");
+      return false;
+    }
 
     const secret = crypto.createHash('sha256').update(token).digest();
     const parsed = new URLSearchParams(initDataRaw);
@@ -33,41 +35,59 @@ function verifyInitData(initDataRaw) {
       .join('\n');
 
     const hmac = crypto.createHmac('sha256', secret).update(dataCheckString).digest('hex');
-    return hmac === hash;
+
+    const valid = hmac === hash;
+
+    if (!valid) {
+      console.log("❌ Неверная подпись initData:");
+      console.log("📥 raw initData:", initDataRaw);
+      console.log("📄 dataCheckString:", dataCheckString);
+      console.log("✅ calculated HMAC:", hmac);
+      console.log("🛑 provided hash:", hash);
+    }
+
+    return valid;
   } catch (e) {
-    console.log("Ошибка в verifyInitData:", e.message);
+    console.log("❌ Ошибка в verifyInitData:", e.message);
     return false;
   }
 }
 
-// Middleware: проверка initData или DEMO-режим
+// ======== Middleware: проверка initData или DEMO режим ========
 app.use((req, res, next) => {
   const initDataRaw = req.headers['x-init-data'];
 
   if (initDataRaw) {
-    if (!verifyInitData(initDataRaw)) {
+    const ok = verifyInitData(initDataRaw);
+    if (!ok) {
+      console.log("⛔️ Подпись initData не прошла");
       return res.status(401).send("Invalid initData");
     }
 
-    const parsed = new URLSearchParams(initDataRaw);
     try {
+      const parsed = new URLSearchParams(initDataRaw);
       const user = JSON.parse(parsed.get('user'));
+
       req.tgUser = {
         id: user.id,
         username: user.username || null,
         photo_url: user.photo_url || null
       };
-    } catch {
-      return res.status(400).send("Invalid user data");
+    } catch (e) {
+      console.log("❌ Ошибка разбора user:", e.message);
+      return res.status(400).send("Bad user data");
     }
-  } else {
-    // Тестовый режим
-    console.log("⚠️ DEMO-режим: initData отсутствует");
-    req.tgUser = { id: 999999, username: 'demo_user' };
+
+    return next();
   }
 
+  // Если initData не передан → включаем тестовый режим
+  console.log("⚠️ DEMO-режим: initData не передан");
+  req.tgUser = { id: 999999, username: 'demo_user' };
   next();
 });
+
+// ======== Маршруты ========
 
 // Получить круги пользователя
 app.get('/circles', async (req, res) => {
@@ -77,7 +97,6 @@ app.get('/circles', async (req, res) => {
     [id]
   );
 
-  // Добавить продажи к каждому кругу
   const circles = result.rows;
   for (let circle of circles) {
     const sells = await pool.query(
@@ -90,7 +109,7 @@ app.get('/circles', async (req, res) => {
   res.json(circles);
 });
 
-// Создать новый круг
+// Создать круг
 app.post('/circles', async (req, res) => {
   const { id } = req.tgUser;
   const { buyAmount } = req.body;
@@ -111,7 +130,7 @@ app.delete('/circles/:id', async (req, res) => {
   res.sendStatus(204);
 });
 
-// Добавить продажу в круг
+// Добавить сделку (продажу)
 app.post('/circles/:id/sells', async (req, res) => {
   const circleId = req.params.id;
   const { amount, currency, price, note } = req.body;
@@ -121,7 +140,6 @@ app.post('/circles/:id/sells', async (req, res) => {
     [circleId, amount, currency, price, note]
   );
 
-  // Обновить оставшуюся сумму в круге
   await pool.query(
     'UPDATE circles SET remaining = remaining - $1 WHERE id = $2',
     [amount * price, circleId]
@@ -130,7 +148,7 @@ app.post('/circles/:id/sells', async (req, res) => {
   res.sendStatus(201);
 });
 
-// Получить логи (заглушка)
+// Заглушка: логи
 app.get('/logs', async (req, res) => {
   res.json([
     { action: "Создан круг", created_at: new Date().toISOString() },
@@ -138,7 +156,7 @@ app.get('/logs', async (req, res) => {
   ]);
 });
 
-// Запуск сервера
+// ======== Запуск сервера ========
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
