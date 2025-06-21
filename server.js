@@ -1,3 +1,4 @@
+console.log("✅ BOT_TOKEN из process.env:", process.env.BOT_TOKEN);
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
