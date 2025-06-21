@@ -1,173 +1,156 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const crypto = require('crypto');
-const axios = require('axios');
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// PostgreSQL connection
 const pool = new Pool({
-  host: process.env.PGHOST,
-  port: 5432,
-  user: process.env.PGUSER,
-  password: process.env.PGPASSWORD,
-  database: process.env.PGDATABASE,
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// Проверка initData от Telegram
-function verifyInitData(initData, botToken) {
-  const hash = new URLSearchParams(initData).get('hash');
-  const params = [...new URLSearchParams(initData)]
-    .filter(([key]) => key !== 'hash')
-    .map(([key, val]) => `${key}=${val}`)
+// Проверка Telegram initData
+function verifyInitData(initDataRaw) {
+  const token = process.env.BOT_TOKEN;
+  const secret = crypto.createHash('sha256').update(token).digest();
+  const parsed = new URLSearchParams(initDataRaw);
+  const hash = parsed.get('hash');
+  parsed.delete('hash');
+
+  const dataCheckString = [...parsed.entries()]
     .sort()
+    .map(([k, v]) => `${k}=${v}`)
     .join('\n');
 
-  const secret = crypto.createHash('sha256').update(botToken).digest();
-  const hmac = crypto.createHmac('sha256', secret).update(params).digest('hex');
+  const hmac = crypto
+    .createHmac('sha256', secret)
+    .update(dataCheckString)
+    .digest('hex');
+
   return hmac === hash;
 }
 
-// Авторизация через Telegram WebApp
-app.post('/auth', async (req, res) => {
-  const { initData } = req.body;
-  if (!verifyInitData(initData, process.env.BOT_TOKEN)) {
-    return res.status(403).send("Недопустимая подпись");
-  }
-
-  const user = JSON.parse(new URLSearchParams(initData).get("user"));
-  const { id, username, first_name, photo_url } = user;
-  await pool.query(`
-    INSERT INTO users (id, username, first_name, photo_url)
-    VALUES ($1, $2, $3, $4)
-    ON CONFLICT (id) DO NOTHING;
-  `, [id, username, first_name, photo_url]);
-
-  res.status(200).send("OK");
+// 📌 Middleware авторизации
+app.use(async (req, res, next) => {
+  const initData = req.headers['x-init-data'];
+  if (!initData || !verifyInitData(initData)) return res.status(401).send('Invalid initData');
+  const parsed = Object.fromEntries(new URLSearchParams(initData));
+  req.tgUser = {
+    id: parsed.user?.id || parsed.user_id,
+    username: parsed.user?.username || '',
+    first_name: parsed.user?.first_name || '',
+    photo_url: parsed.user?.photo_url || ''
+  };
+  // Сохраняем пользователя
+  await pool.query(
+    `INSERT INTO users (telegram_id, username, first_name, photo_url)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (telegram_id) DO UPDATE SET username = $2, first_name = $3, photo_url = $4`,
+    [req.tgUser.id, req.tgUser.username, req.tgUser.first_name, req.tgUser.photo_url]
+  );
+  next();
 });
 
-// Получение кругов
-app.get('/circles', async (req, res) => {
-  const { user_id } = req.query;
-  const circles = await pool.query(`SELECT * FROM circles WHERE user_id = $1 ORDER BY id DESC`, [user_id]);
-  const sells = await pool.query(`SELECT * FROM sells WHERE user_id = $1`, [user_id]);
-
-  const result = circles.rows.map(c => ({
-    ...c,
-    buyAmount: parseFloat(c.buyamount),
-    remaining: parseFloat(c.remaining),
-    sells: sells.rows.filter(s => s.circle_id === c.id)
-  }));
-
-  res.json(result);
-});
-
-// Создание круга
+// 🚀 Создание круга
 app.post('/circles', async (req, res) => {
-  const { buyAmount, user_id } = req.body;
+  const { buyAmount } = req.body;
+  const { id: user_id } = req.tgUser;
   const result = await pool.query(
-    `INSERT INTO circles (buyamount, remaining, closed, user_id, created_at)
-     VALUES ($1, $1, false, $2, NOW()) RETURNING *`, [buyAmount, user_id]
+    `INSERT INTO circles (user_id, buyamount, remaining, closed)
+     VALUES ($1, $2, $2, false) RETURNING *`,
+    [user_id, buyAmount]
   );
-  await pool.query(`INSERT INTO logs (type, user_id, circle_id, message, created_at)
-                    VALUES ('create_circle', $2, $1, 'Создан круг', NOW())`, [result.rows[0].id, user_id]);
-  res.status(201).json(result.rows[0]);
+  res.json(result.rows[0]);
 });
 
-// Добавление сделки
-app.post('/circles/:id/sells', async (req, res) => {
-  const circleId = req.params.id;
-  const { amount, currency, price, note, user_id } = req.body;
-
-  const circle = await pool.query('SELECT * FROM circles WHERE id = $1 AND user_id = $2', [circleId, user_id]);
-  if (!circle.rows.length) return res.status(404).send("Круг не найден");
-
-  const remaining = parseFloat(circle.rows[0].remaining) - amount;
-  const closed = remaining <= 0;
-
-  await pool.query(`UPDATE circles SET remaining = $1, closed = $2 WHERE id = $3`, [remaining, closed, circleId]);
+// ➕ Добавить сделку в круг
+app.post('/circles/:circleId/sells', async (req, res) => {
+  const { amount, currency, price, note } = req.body;
+  const circleId = req.params.circleId;
   const result = await pool.query(
-    `INSERT INTO sells (circle_id, amount, currency, price, note, user_id, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *`,
-    [circleId, amount, currency, price, note, user_id]
+    `INSERT INTO sells (circle_id, amount, currency, price, note)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [circleId, amount, currency, price, note]
   );
-
-  await pool.query(`INSERT INTO logs (type, user_id, circle_id, message, created_at)
-                    VALUES ('add_sell', $1, $2, 'Добавлена продажа', NOW())`, [user_id, circleId]);
-
-  res.status(201).json(result.rows[0]);
+  // обновить remaining
+  await pool.query(
+    `UPDATE circles SET remaining = remaining - $1 WHERE id = $2`,
+    [amount, circleId]
+  );
+  res.json(result.rows[0]);
 });
 
-// Обновление сделки
-app.patch('/sells/:id', async (req, res) => {
-  const { amount, currency, price, note, user_id } = req.body;
-  const id = req.params.id;
-  const result = await pool.query(
-    `UPDATE sells SET amount = $1, currency = $2, price = $3, note = $4 WHERE id = $5 AND user_id = $6 RETURNING *`,
-    [amount, currency, price, note, id, user_id]
-  );
-  res.status(200).json(result.rows[0]);
-});
-
-// Удаление круга
+// ❌ Удалить круг
 app.delete('/circles/:id', async (req, res) => {
-  const { user_id } = req.query;
-  const id = req.params.id;
-  await pool.query('DELETE FROM sells WHERE circle_id = $1 AND user_id = $2', [id, user_id]);
-  await pool.query('DELETE FROM circles WHERE id = $1 AND user_id = $2', [id, user_id]);
-  res.status(204).send();
+  const { id } = req.params;
+  await pool.query(`DELETE FROM sells WHERE circle_id = $1`, [id]);
+  await pool.query(`DELETE FROM circles WHERE id = $1`, [id]);
+  res.sendStatus(200);
 });
 
-// Аналитика круга
-app.get('/analytics/:circleId', async (req, res) => {
-  const { user_id } = req.query;
-  const { circleId } = req.params;
-  const sells = await pool.query('SELECT * FROM sells WHERE circle_id = $1 AND user_id = $2', [circleId, user_id]);
-  const circle = await pool.query('SELECT * FROM circles WHERE id = $1 AND user_id = $2', [circleId, user_id]);
-  if (!circle.rows.length) return res.status(404).send("Круг не найден");
-
-  const revenue = sells.rows.reduce((sum, s) => sum + parseFloat(s.amount) * parseFloat(s.price), 0);
-  const cost = parseFloat(circle.rows[0].buyamount);
-  const pnl = revenue - cost;
-
-  res.json({
-    buyAmount: cost,
-    revenue: revenue,
-    pnl: pnl,
-    profitRate: (pnl / cost) * 100
-  });
+// 📝 Изменить сделку
+app.patch('/sells/:id', async (req, res) => {
+  const { amount, currency, price, note } = req.body;
+  const { id } = req.params;
+  await pool.query(
+    `UPDATE sells SET amount = $1, currency = $2, price = $3, note = $4 WHERE id = $5`,
+    [amount, currency, price, note, id]
+  );
+  res.sendStatus(200);
 });
 
-// Генерация заметки через OpenAI
-// новый: локальная генерация заметки
-app.post('/note/ai', async (req, res) => {
-  const { currency, price } = req.body;
-  const templates = [
-    `Сделка с ${currency} по цене ${price}₽`,
-    `Продажа ${currency} выгодно по ${price}₽`,
-    `${currency} по ${price}₽ — быстрый обмен`,
-    `Биржевой курс ${currency}: ${price}₽`
-  ];
-  const note = templates[Math.floor(Math.random() * templates.length)];
-  res.json({ note });
-});
+// 📊 Получить круги + сделки
+app.get('/circles', async (req, res) => {
+  const { id: user_id } = req.tgUser;
+  const result = await pool.query(`SELECT * FROM circles WHERE user_id = $1 ORDER BY id DESC`, [user_id]);
+  const circles = result.rows;
 
-
-// Проверка кругов каждые 10 минут (долго незакрытые)
-setInterval(async () => {
-  const res = await pool.query(`
-    SELECT * FROM circles WHERE closed = false AND created_at < NOW() - INTERVAL '24 hours'
-  `);
-  for (let circle of res.rows) {
-    await axios.post(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
-      chat_id: circle.user_id,
-      text: `⚠️ Круг #${circle.id} остаётся незакрытым более 24 часов`
-    });
+  for (let circle of circles) {
+    const sells = await pool.query(`SELECT * FROM sells WHERE circle_id = $1 ORDER BY id`, [circle.id]);
+    circle.sells = sells.rows;
   }
-}, 600000); // 10 мин
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`✅ Сервер запущен на порту ${PORT}`));
+  res.json(circles);
+});
+
+// 📈 Аналитика по кругу
+app.get('/analytics/:circleId', async (req, res) => {
+  const { circleId } = req.params;
+  const result = await pool.query(`SELECT * FROM circles WHERE id = $1`, [circleId]);
+  const circle = result.rows[0];
+  if (!circle) return res.status(404).send('Круг не найден');
+
+  const sells = await pool.query(`SELECT * FROM sells WHERE circle_id = $1`, [circleId]);
+
+  const totalRevenue = sells.rows.reduce((acc, s) => acc + s.amount * s.price, 0);
+  const totalSold = circle.buyamount - circle.remaining;
+  const pnl = totalRevenue - circle.buyamount;
+  const percent = (totalSold / circle.buyamount) * 100;
+
+  res.json({ pnl, revenue: totalRevenue, progress: percent });
+});
+
+// 🧾 Логи
+app.post('/logs', async (req, res) => {
+  const { action } = req.body;
+  const { id: user_id } = req.tgUser;
+  await pool.query(
+    `INSERT INTO logs (user_id, action) VALUES ($1, $2)`,
+    [user_id, action]
+  );
+  res.sendStatus(200);
+});
+
+app.get('/logs', async (req, res) => {
+  const { id: user_id } = req.tgUser;
+  const result = await pool.query(`SELECT * FROM logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100`, [user_id]);
+  res.json(result.rows);
+});
+
+// 🌐 Старт сервера
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
